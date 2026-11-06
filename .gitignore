@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.zip
+sonar-reports/
+# Local session exports, analysis state and diagnostics are never public sources.
+*.json
+*.jsonl
+*.db
+*.db-*
+*.sqlite*
+*.log
+.env
+.env.*
+!.env.example
