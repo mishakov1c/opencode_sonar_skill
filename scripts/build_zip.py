@@ -4,8 +4,8 @@ import argparse
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
-FILES = ('SKILL.md', 'README.md', 'scripts/sonar_index.py', 'scripts/sonar_state.py',
-         'scripts/sonar_ingest.py')
+FILES = ('SKILL.md', 'README.md', 'LICENSE', 'scripts/sonar_index.py',
+         'scripts/sonar_ingest.py', 'scripts/sonar_state.py', 'scripts/sonar_gitlab.py')
 
 
 def main():
