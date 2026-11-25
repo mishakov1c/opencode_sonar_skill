@@ -3,11 +3,12 @@
 import json
 import contextlib
 import io
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sonar_index import api_url
 from sonar_ingest import IntakeError, connect, current_session, extract_json, ingest, validate_page
@@ -28,6 +29,10 @@ def payload(total=77, page=1, size=100):
 
 class IntakeTests(unittest.TestCase):
     def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop('OPENCODE_SESSION_ID', None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -234,67 +239,81 @@ class IntakeTests(unittest.TestCase):
 
 
 class V2IntakeTests(unittest.TestCase):
-    """Формат OpenCode 2: session_v2 + session_message, tool-части внутри content."""
+    """Синтетическая история API OpenCode V2, без реального CLI и SQLite."""
+
+    current = 'ses_current'
+    other = 'ses_other'
 
     def setUp(self):
+        env = patch.dict(os.environ, {'OPENCODE_SESSION_ID': self.current})
+        env.start()
+        self.addCleanup(env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.db = sqlite3.connect(self.root / 'opencode.db')
-        self.addCleanup(self.db.close)
-        self.db.executescript('''
-            CREATE TABLE session_v2(id TEXT, directory TEXT);
-            CREATE TABLE session_message(id TEXT, session_id TEXT, type TEXT,
-                seq INTEGER, time_created INT, time_updated INT, data TEXT);
-            INSERT INTO session_v2 VALUES('current','project'),('other','project');
-        ''')
+        self.messages = {self.current: [], self.other: []}
         self.number = 0
         self.reports = self.root / 'reports'
         for target in ('socket.socket', 'socket.create_connection', 'urllib.request.urlopen', 'subprocess.Popen'):
             guard = patch(target, side_effect=AssertionError('Сеть и внешние программы запрещены'))
             guard.start()
             self.addCleanup(guard.stop)
+        cli = patch.object(sonar_ingest, 'api_cli', return_value='cli.exe')
+        cli.start()
+        self.addCleanup(cli.stop)
+        run = patch.object(sonar_ingest.subprocess, 'run', side_effect=self.api_response)
+        self.cli_run = run.start()
+        self.addCleanup(run.stop)
         self.add('user', '# Sonar: разбор замечаний по модулям\nПример: {"issues": []}')
         self.add('user', URL)
         self.handoff()
 
-    def add(self, role, text=None, part=None, session='current', status='completed'):
+    @staticmethod
+    def api_command(session):
+        return ['cli.exe', 'api', 'get', f'/api/session/{session}/message?limit=100&order=asc']
+
+    def api_response(self, command, *, capture_output, encoding, timeout):
+        for session, messages in self.messages.items():
+            if command == self.api_command(session):
+                return Mock(returncode=0, stdout=json.dumps({'data': messages, 'cursor': {}}))
+        self.fail(f'Неожиданный вызов CLI: {command}')
+
+    def add(self, role, text=None, part=None, *, session=None):
         self.number += 1
         mid = 'message-' + str(self.number).zfill(4)
+        message = {'id': mid, 'type': role}
         if role == 'assistant':
-            data = {'agent': 'build', 'model': 'demo', 'finish': 'tool-calls',
-                    'content': [part or {'type': 'text', 'text': ''}]}
-            kind = 'assistant'
+            message['content'] = [part]
         else:
-            data = {'text': text, 'time': self.number}
-            kind = 'user'
-        payload = part or {}
-        if role == 'assistant' and payload.get('type') == 'tool':
-            payload = dict(payload)
-            state = dict(payload.get('state') or {})
-            state['status'] = status
-            payload['state'] = state
-            data['content'] = [payload]
-        self.db.execute('INSERT INTO session_message VALUES(?,?,?,?,?,?,?)',
-                        (mid, session, kind, self.number, self.number, self.number,
-                         json.dumps(data, ensure_ascii=False)))
-        self.db.commit()
+            message['text'] = text
+        self.messages[session or self.current].append(message)
         return mid
 
+    def add_tool(self, command, status, *, output='', session=None):
+        return self.add('assistant', part={'type': 'tool', 'name': 'shell', 'state': {
+            'status': status, 'input': {'command': command},
+            'content': [{'type': 'text', 'text': output}]}}, session=session)
+
     def handoff(self):
-        self.add('assistant', part={'type': 'tool', 'id': 'tool-api', 'name': 'bash',
-                 'state': {'input': {'command': 'python scripts/sonar_index.py api-url "' + URL + '"'},
-                           'content': api_url(URL) + '\nWAITING_FOR_USER_JSON\n'}})
+        self.add_tool('python scripts/sonar_index.py api-url "' + URL + '"',
+                      'completed', output=api_url(URL) + '\nWAITING_FOR_USER_JSON\n')
+
+    def call(self, status='running', *, session=None):
+        return self.add_tool('python scripts/sonar_ingest.py --call-id ' + TOKEN, status, session=session)
 
     def run_ingest(self):
-        return ingest(self.db, 'current', self.reports)
+        sid, messages = sonar_ingest.api_history(TOKEN)
+        return ingest(None, sid, self.reports, messages)
 
     def test_v2_realistic_77_and_repeat_preserves_decisions(self):
         text = json.dumps(payload(), ensure_ascii=False)
         mid = self.add('user', text)
-        self.add('user', json.dumps(payload(1)), session='other')
+        self.call()
+        self.add('user', json.dumps(payload(1)), session=self.other)
         result = self.run_ingest()
         self.assertEqual((result['total'], result['modules'], result['messageIDs']), (77, 1, [mid]))
+        self.cli_run.assert_called_once_with(
+            self.api_command(self.current), capture_output=True, encoding='utf-8', timeout=60)
         state = Path(result['statePath'])
         data = json.loads(state.read_text())
         data['decisions'] = {'1': {'status': 'skipped', 'history': [{'status': 'agreed'}]}}
@@ -302,22 +321,32 @@ class V2IntakeTests(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.reports.iterdir()}
         self.assertEqual(self.run_ingest(), result)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.reports.iterdir()})
+        raw, = self.reports.glob('*-p1.json')
+        self.assertEqual(raw.read_text(encoding='utf-8'), text)
 
     def test_v2_session_binding_running_only_unique(self):
-        def call(status, session='current'):
-            self.add('assistant', part={'type': 'tool', 'id': 'tool-self', 'name': 'bash',
-                     'state': {'input': {'command': 'python scripts/sonar_ingest.py --call-id ' + TOKEN}}}, session=session, status=status)
-        with self.assertRaises(IntakeError):
-            current_session(self.db, TOKEN)
-        call('running')
-        self.assertEqual(current_session(self.db, TOKEN), 'current')
-        call('completed', 'other')
-        with self.assertRaises(IntakeError):
-            current_session(self.db, TOKEN)
+        error = 'не подтвердил единственный выполняемый вызов'
+        self.call(session=self.other)
+        with self.assertRaisesRegex(IntakeError, error):
+            sonar_ingest.api_history(TOKEN)
+        self.cli_run.assert_called_once_with(
+            self.api_command(self.current), capture_output=True, encoding='utf-8', timeout=60)
+
+        self.call('completed')
+        with self.assertRaisesRegex(IntakeError, error):
+            sonar_ingest.api_history(TOKEN)
+        self.messages[self.current].pop()
+        self.call()
+        sid, _ = sonar_ingest.api_history(TOKEN)
+        self.assertEqual(sid, self.current)
+        self.call('completed')
+        with self.assertRaisesRegex(IntakeError, error):
+            sonar_ingest.api_history(TOKEN)
 
     def test_v2_invalid_last_message_no_old_fallback(self):
         self.add('user', json.dumps(payload()))
         self.add('user', '{"issues":')
+        self.call()
         with self.assertRaises(IntakeError):
             self.run_ingest()
         self.assertFalse(self.reports.exists())
@@ -325,22 +354,26 @@ class V2IntakeTests(unittest.TestCase):
         self.assertEqual(self.run_ingest()['status'], 'READY')
 
     def test_v2_other_session_has_no_source(self):
-        self.add('user', json.dumps(payload()), session='other')
-        with self.assertRaises(IntakeError):
-            ingest(self.db, 'other', self.reports)
+        self.add('user', json.dumps(payload()), session=self.other)
+        self.call(session=self.other)
+        with patch.dict(os.environ, {'OPENCODE_SESSION_ID': self.other}), \
+             self.assertRaisesRegex(IntakeError, 'нет исходной ссылки SonarQube'):
+            self.run_ingest()
+        self.cli_run.assert_called_once_with(
+            self.api_command(self.other), capture_output=True, encoding='utf-8', timeout=60)
 
     def test_v2_new_url_requires_new_handoff(self):
         self.add('user', URL.replace('4242', '4243'))
         self.add('user', json.dumps(payload()))
-        with self.assertRaises(IntakeError):
+        self.call()
+        with self.assertRaisesRegex(IntakeError, 'не подтверждена выдача API-ссылки'):
             self.run_ingest()
 
     def test_v2_main_single_compact_response(self):
         self.add('user', json.dumps(payload()))
-        self.add('assistant', part={'type': 'tool', 'id': 'tool-self', 'name': 'bash',
-                 'state': {'input': {'command': 'python scripts/sonar_ingest.py --call-id ' + TOKEN}}}, status='running')
+        self.call()
         out = io.StringIO()
-        with patch.object(sonar_ingest, 'database_path', return_value=self.root / 'opencode.db'), \
+        with patch.object(sonar_ingest, 'database_path', side_effect=AssertionError('V2 не должен читать SQLite')), \
              patch.object(sonar_ingest.Path, 'home', return_value=self.root), \
              patch('sys.argv', ['sonar_ingest.py', '--call-id', TOKEN]), contextlib.redirect_stdout(out):
             self.assertEqual(sonar_ingest.main(), 0)

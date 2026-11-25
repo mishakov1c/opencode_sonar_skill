@@ -4,18 +4,20 @@
 import contextlib
 import io
 import json
+import os
 import runpy
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import sonar_ingest
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "sonar_state.py"
 INDEX = ROOT / "sonar_index.py"
 SKILL = ROOT.parent / "SKILL.md"
-INGEST = ROOT / "sonar_ingest.py"
 
 
 def run(args):
@@ -333,11 +335,9 @@ def test_generic_markdown_import(tmp):
 def test_ingest_v2_handoff(tmp):
     # Полный сценарий V2: api-url → ответ агента → JSON пользователя → ingest → READY.
     # Вывод инструмента в OpenCode 2 лежит в state.content как массив {type, text}.
-    import sqlite3
-
-    mod = runpy.run_path(str(INGEST))
     source = "http://sonar.example:9000/project/issues?id=demo&pullRequest=3&resolved=false"
-    api_link = mod["api_url"](source)
+    api_link = sonar_ingest.api_url(source)
+    call_id = "ab" * 16
     payload = {
         "total": 1, "p": 1, "ps": 100,
         "paging": {"pageIndex": 1, "pageSize": 100, "total": 1},
@@ -352,66 +352,61 @@ def test_ingest_v2_handoff(tmp):
         ],
     }
 
-    def make_db(name, *, waiting=True, order_ok=True, api_ok=True):
-        call_id = "ab" * 16
-        db = sqlite3.connect(str(tmp / name))
-        db.execute("CREATE TABLE session (id TEXT)")
-        db.execute("CREATE TABLE session_message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER)")
-        db.execute("INSERT INTO session VALUES ('ses_test')")
+    def run_ingest(name, *, waiting=True, order_ok=True, api_ok=True):
         link = api_link if api_ok else api_link.replace("pullRequest=3", "pullRequest=4")
-        out_text = link + "\nWAITING_FOR_USER_JSON" if waiting else link
+        output = [link, "WAITING_FOR_USER_JSON"] if waiting else [link]
         messages = [
-            ("m1", {"text": source}, 1),
-            ("m2", {"agent": "a", "content": [{"type": "tool", "state": {
+            {"id": "m1", "type": "user", "text": source},
+            {"id": "m2", "type": "assistant", "content": [{"type": "tool", "name": "shell", "state": {
                 "input": {"command": 'python scripts/sonar_index.py api-url "' + source + '"'},
                 "status": "completed",
-                "content": [{"type": "text", "text": t} for t in out_text.split("\n")],
-            }}]}, 2 if order_ok else 4),
-            ("m3", {"text": json.dumps(payload, ensure_ascii=False)}, 3 if order_ok else 2),
-            ("m4", {"agent": "a", "content": [{"type": "tool", "state": {
+                "content": [{"type": "text", "text": text} for text in output],
+            }}]},
+            {"id": "m3", "type": "user", "text": json.dumps(payload, ensure_ascii=False)},
+            {"id": "m4", "type": "assistant", "content": [{"type": "tool", "name": "shell", "state": {
                 "input": {"command": "python scripts/sonar_ingest.py --call-id " + call_id},
                 "status": "running",
-            }}]}, 5),
+            }}]},
         ]
-        for mid, data, created in sorted(messages, key=lambda row: row[2]):
-            db.execute("INSERT INTO session_message VALUES (?,?,?,?)",
-                       (mid, "ses_test", json.dumps(data, ensure_ascii=False), created))
-        db.commit()
-        return db, call_id
+        if not order_ok:
+            messages[1], messages[2] = messages[2], messages[1]
+        response = Mock(returncode=0, stdout=json.dumps({"data": messages, "cursor": {}}))
+        blocked = AssertionError("Network and external programs are forbidden during ingestion")
+        with contextlib.ExitStack() as stack:
+            for target in ("socket.socket", "socket.create_connection", "urllib.request.urlopen", "subprocess.Popen"):
+                stack.enter_context(patch(target, side_effect=blocked))
+            stack.enter_context(patch.dict(os.environ, {"OPENCODE_SESSION_ID": "ses_test"}))
+            stack.enter_context(patch.object(sonar_ingest, "api_cli", return_value="cli.exe"))
+            cli = stack.enter_context(patch.object(sonar_ingest.subprocess, "run", return_value=response))
+            sid, history = sonar_ingest.api_history(call_id)
+            if sid != "ses_test":
+                fail("api_history returned another session: " + sid)
+            cli.assert_called_once_with(
+                ["cli.exe", "api", "get", "/api/session/ses_test/message?limit=100&order=asc"],
+                capture_output=True, encoding="utf-8", timeout=60,
+            )
+            return sonar_ingest.ingest(None, sid, tmp / name, history)
 
-    def expect_error(db, call_id, fragment):
-        try:
-            sid = mod["current_session"](db, call_id)
-            mod["ingest"](db, sid, str(tmp / ("reports-" + fragment)))
-        except mod["IntakeError"] as exc:
-            if fragment not in str(exc):
-                fail("error mismatch: " + str(exc))
-        else:
-            fail("scenario must be refused: " + fragment)
-
-    db, call_id = make_db("ok.db")
-    sid = mod["current_session"](db, call_id)
-    if sid != "ses_test":
-        fail("current_session returned another session: " + sid)
-    result = mod["ingest"](db, sid, str(tmp / "reports-ok"))
+    result = run_ingest("reports-ok")
     if result["status"] != "READY" or result["total"] != 1 or result["received"] != 1:
         fail("unexpected READY payload: " + json.dumps(result))
     for field in ("issuesPath", "indexPath", "statePath"):
         if not Path(result[field]).is_file():
             fail("missing artifact: " + result[field])
-    db.close()
-
-    db, call_id = make_db("no-waiting.db", waiting=False)
-    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
-    db.close()
-
-    db, call_id = make_db("wrong-order.db", order_ok=False)
-    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
-    db.close()
-
-    db, call_id = make_db("wrong-api.db", api_ok=False)
-    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
-    db.close()
+    for name, options in (
+        ("no-waiting", {"waiting": False}),
+        ("wrong-order", {"order_ok": False}),
+        ("wrong-api", {"api_ok": False}),
+    ):
+        try:
+            run_ingest(name, **options)
+        except sonar_ingest.IntakeError as exc:
+            if "не подтверждена выдача API-ссылки" not in str(exc):
+                fail(name + ": error mismatch: " + str(exc))
+        else:
+            fail("scenario must be refused: " + name)
+        if (tmp / name).exists():
+            fail("rejected scenario created reports: " + name)
 
 
 def test_skill_contract():
@@ -434,7 +429,8 @@ def test_skill_contract():
             fail("SKILL.md missing: " + item)
     if "Пустой аргумент — это `new`, не `resume`" not in text:
         fail("new review is not separated from resume")
-    stop = text.split("## СТОП после ссылки: ожидание JSON (приоритетное правило)", 1)[1]
+    stop_heading = "## Резервный ручной режим: СТОП после ссылки SonarQube"
+    stop = text.split(stop_heading, 1)[1]
     stop = stop.split("Аргумент команды:", 1)[0]
     link_step = text.split("### Этап 1. Сформировать ссылку и остановиться", 1)[1]
     link_step = link_step.split("### Этап 2.", 1)[0]
@@ -452,7 +448,7 @@ def test_skill_contract():
     for item in ('sonar_ingest.py --call-id', 'Не проси сохранить файл', 'только русский'):
         if item not in text:
             fail('Missing chat intake contract: ' + item)
-    if text.index("## СТОП после ссылки") > text.index("route --arg"):
+    if text.index(stop_heading) > text.index("route --arg"):
         fail("JSON stop rules must precede routing and review instructions")
 
 
