@@ -64,7 +64,8 @@ HTTP 403 выводится как ошибка доступа, не как от
    New-Item -ItemType Directory -Force -Path "$target\scripts" | Out-Null
    Copy-Item .\SKILL.md -Destination $target -Force
    Copy-Item .\README.md -Destination $target -Force
-   Copy-Item .\scripts\sonar_index.py, .\scripts\sonar_ingest.py, .\scripts\sonar_state.py -Destination "$target\scripts" -Force
+   Copy-Item .\LICENSE -Destination $target -Force
+   Copy-Item .\scripts\sonar_index.py, .\scripts\sonar_ingest.py, .\scripts\sonar_state.py, .\scripts\sonar_gitlab.py -Destination "$target\scripts" -Force
    ```
 
    Итоговый файл должен находиться по адресу `%USERPROFILE%\.config\opencode\skills\sonar\SKILL.md`.
@@ -141,6 +142,7 @@ HTTP 403 выводится как ошибка доступа, не как от
 ```powershell
 python scripts/test_sonar.py
 python scripts/test_sonar_ingest.py
+python scripts/test_sonar_api.py
 python scripts/test_sonar_measure.py
 python scripts/test_build_zip.py
 ```
@@ -151,7 +153,7 @@ python scripts/test_build_zip.py
 python scripts/build_zip.py --output sonar-opencode-skill.zip
 ```
 
-Архив содержит ровно пять файлов под каталогом `sonar/`: `SKILL.md`, `README.md` и три рабочих скрипта `sonar_index.py`, `sonar_ingest.py`, `sonar_state.py`. Тесты, сборщик, диагностический `sonar_measure.py`, пользовательские JSON и Git-история в него не попадают. Диагностический скрипт в исходниках запускается только вручную; реальные экспорты для тестов не нужны.
+Архив содержит ровно семь файлов под каталогом `sonar/`: `SKILL.md`, `README.md`, `LICENSE` и четыре рабочих скрипта `sonar_index.py`, `sonar_ingest.py`, `sonar_state.py`, `sonar_gitlab.py`. Тесты, сборщик, диагностический `sonar_measure.py`, пользовательские JSON и Git-история в него не попадают. Диагностический скрипт в исходниках запускается только вручную; реальные экспорты для тестов не нужны.
 
 Внутренняя логика работы агента находится в [`SKILL.md`](SKILL.md). Изменять её при установке не требуется.
 

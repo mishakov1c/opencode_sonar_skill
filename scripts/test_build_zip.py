@@ -10,8 +10,8 @@ import unittest
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME = ('SKILL.md', 'README.md', 'scripts/sonar_index.py',
-           'scripts/sonar_ingest.py', 'scripts/sonar_state.py')
+RUNTIME = ('SKILL.md', 'README.md', 'LICENSE', 'scripts/sonar_index.py',
+           'scripts/sonar_ingest.py', 'scripts/sonar_state.py', 'scripts/sonar_gitlab.py')
 
 
 class BuildTests(unittest.TestCase):
@@ -47,6 +47,8 @@ class BuildTests(unittest.TestCase):
                                     cwd=directory, check=True, capture_output=True, text=True)
             self.assertEqual(result.stdout.splitlines()[-1], 'WAITING_FOR_USER_JSON')
             subprocess.run([sys.executable, str(scripts / 'sonar_ingest.py'), '--help'],
+                           cwd=directory, check=True, capture_output=True)
+            subprocess.run([sys.executable, str(scripts / 'sonar_gitlab.py'), '--help'],
                            cwd=directory, check=True, capture_output=True)
 
 
